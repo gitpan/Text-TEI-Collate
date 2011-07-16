@@ -5,10 +5,8 @@ use lib 'lib';
 use Data::Dumper;
 use Getopt::Long;
 use Storable qw( store_fd retrieve );
-use Text::WagnerFischer::Armenian qw( distance );
+use Text::WagnerFischer;
 use Text::TEI::Collate;
-use Words::Armenian;
-use utf8;
 
 binmode STDOUT, ":utf8";
 binmode STDERR, ":utf8";
@@ -16,7 +14,7 @@ eval { no warnings; binmode $DB::OUT, ":utf8"; };
 
 # Default option values
 my( $col_width, $fuzziness ) = ( 25, 50 );
-my( $CSV, $storable, $outfile, $infile, $text, $debug, %argspec );
+my( $CSV, $storable, $outfile, $infile, $text, $cx, $json, $debug, %argspec );
 
 GetOptions( 'csv' => \$CSV,
 	    'width=i' => \$col_width,
@@ -24,6 +22,8 @@ GetOptions( 'csv' => \$CSV,
 	    'outfile=s' => \$outfile,
 	    'store=s' => \$infile,
 	    'text' => \$text,
+	    'cx' => \$cx,
+	    'json' => \$json,
 	    'debug:i' => \$debug,
 	    'argspec=s' => \%argspec,
 	    'fuzziness=i' => \$fuzziness,
@@ -56,44 +56,55 @@ unless( keys %argspec ) {
 
 ## Get busy. 
 my( @files ) = @ARGV;
+if( $json ) {  # The 'file' is the JSON string.
+    my @lines;
+    while( <> ) {
+	push( @lines, $_ );
+    }
+    @files = ( join ( '', @lines ) );
+}
+
 my $aligner = Text::TEI::Collate->new( 'fuzziness_sub' => \&fuzzy_match,
 				       'debug' => $debug,
-				       'distance_sub' => \&Text::WagnerFischer::Armenian::distance,
-				       'canonizer' => \&Words::Armenian::canonize_word,
-				       'comparator' => \&Words::Armenian::comparator,
-				       'TEI' => !$text,
+				       'distance_sub' => \&Text::WagnerFischer::distance,
     );
 
 
-my @results;
+my @mss;
 if( $infile ) {
     no warnings 'once'; 
     $Storable::Eval = 1;
     my $savedref = retrieve( $infile );
-    @results = @$savedref;
-    @files = map { $_->sigil } @results;
+    @mss = @$savedref;
+    @files = map { $_->sigil } @mss;
 } else {
-    @results = $aligner->align( @files );
+    foreach ( @files ) {
+	push( @mss, $aligner->read_source( $_ ) );
+    }
+    $aligner->align( @mss );
+    if( $cx || $json ) {
+	# We didn't have filenames to display; use sigla instead.
+	@files = map { $_->sigil } @mss;
+    }
 }
-
 
 if( $storable ) {
     # Store the array.
     no warnings 'once';
     $Storable::Deparse = 1;
-    store_fd( \@results, \*OUT );
+    store_fd( \@mss, \*OUT );
     exit;
 } 
 
 # Print the array.
 print_fnames() if $CSV;
-foreach my $i ( 0 .. $#{$results[0]->words } ) {
+foreach my $i ( 0 .. $#{$mss[0]->words } ) {
     my $output_str;
     if( $CSV ) {
-	$output_str = join( ',', map { '"' . $_->words->[$i]->printable . '"' } @results ) . "\n";
+	$output_str = join( ',', map { '"' . $_->words->[$i]->printable . '"' } @mss ) . "\n";
     } else {
 	my $format = '%-' . $col_width . "s";
-	$output_str = sprintf( "%-4d:", $i ) . join( '| ', map { sprintf( $format, $_->words->[$i]->printable ) } @results ) . "\n";
+	$output_str = sprintf( "%-4d:", $i ) . join( '| ', map { sprintf( $format, $_->words->[$i]->printable ) } @mss ) . "\n";
     }
     # print_fnames( $i ) unless ( $CSV || $i % 100 );
     print $output_str;
@@ -112,10 +123,16 @@ sub open_file {
 
 sub print_fnames {
     print "\n\tLine $_[0]\n" if $_[0];
+    my @titles = @files;
+    if( $cx ) {
+	@titles = ( 0 .. $#files );
+    } elsif( $json ) {
+	@titles = map { $_->sigil } @mss;
+    }
     if( $CSV ) {
-	print join( ',', @files ) . "\n";
+	print join( ',', @titles ) . "\n";
     } else {
-	print join( '| ', map { sprintf( "%-25s", $_ ) } @files ) . "\n";
+	print join( '| ', map { sprintf( "%-25s", $_ ) } @titles ) . "\n";
     }
 }
 
@@ -140,4 +157,15 @@ sub fuzzy_match {
     } else {
 	return( $dist < ( length( $ref_str ) * $fuzz / 100 ) );
     }
+}
+
+sub normalize_unicode {
+    my $word = shift;
+    my @normalized;
+    my @letters = split( '', lc( $word ) );
+    foreach my $l ( @letters ) {
+	my $d = chr( ord( NFKD( $l ) ) );
+	push( @normalized, $d );
+    }
+    return join( '', @normalized );
 }

@@ -4,11 +4,13 @@ use strict;
 use vars qw( $VERSION );
 use Algorithm::Diff;
 # use Contextual::Return ## TODO: examine
+use IPC::Run qw( run binary );
+use JSON qw( decode_json );
 use Text::TEI::Collate::Word;
 use Text::TEI::Collate::Manuscript;
 use XML::LibXML;
 
-$VERSION = "1.0";
+$VERSION = "1.1";
 
 =head1 SYNOPSIS
 
@@ -16,15 +18,22 @@ $VERSION = "1.0";
   my $aligner = Text::TEI::Collate->new();
 
   # Read from strings.
-  my @collated_texts = $aligner->align( $string1, $string2, [ .. $stringN ] );
+  my @manuscripts;
+  foreach my $str ( @strings_to_collate ) {
+    push( @manuscripts, $aligner->read_source( $str ) );
+  }
+  $aligner->align( @manuscripts; );
 
-  # Read from filehandles.
-  my $fh1 = new IO::File;
-  $fh1->open( $first_file, "<:utf8" );
-  my $fh2 = new IO::File;
-  $fh2->open( $first_file, "<:utf8" );
-  # ...
-  my @collated_from_fh = $aligner->align( $fh1, $fh2, [ .. $fhN ] );
+  # Read from files.  Also works for XML::LibXML::Document objects.
+  @manuscripts = ();
+  foreach my $xml_file ( @TEI_files_to_collate ) {
+    push( @manuscripts, $aligner->read_source( $xml_file ) )
+  }
+  $aligner->align( @manuscripts );
+
+  # Read from a JSON input.
+  @manuscripts = $aligner->read_source( $JSON_string );
+  $aligner->align( @manuscripts );
   
 =head1 DESCRIPTION
 
@@ -33,16 +42,19 @@ Text::TEI::Collate is the beginnings of a collation program for multiple
 object-oriented interface, mostly for the convenience of the author
 and for the ability to have global settings.
 
-The object is the alignment engine, or "aligner".  The method that a
-user will care about is "align"; the other methods in this file are
-public in case a user needs a subset of this package's functionality.
+The object is the alignment engine, or "aligner". The methods that a user will
+care about are "read_source" and "align", as well as the various output
+methods; the other methods in this file are public in case a user needs a
+subset of this package's functionality.
 
-An aligner takes two or more texts; the texts can either be strings or
-IO::File objects.  It returns two or more arrays -- one for each text
-input -- in which identical and similar words are lined up with each
-other, via empty-string padding.
+An aligner takes two or more texts; the texts can be strings, filenames, or
+XML::LibXML::Document objects. It returns two or more Manuscript objects --
+one for each text input -- in which identical and similar words are lined up
+with each other, via empty-string padding.
 
-* TODO: describe word objects
+Please see the documentation for L<Text::TEI::Collate::Manuscript> and
+L<Text::TEI::Collate::Word> for more information about the manuscript and word
+objects.
 
 =head1 METHODS
 
@@ -59,81 +71,313 @@ options are listed.
 
 =item B<fuzziness> - The maximum allowable word distance for an approximate match, expressed as a percentage of Levenshtein distance / word length.
 
-=item B<punct_as_word> - Treat punctuation as separate words.  Not yet implemented
-
-=item B<not_punct> - Takes an array ref full of characters that should not be treated as punctuation.
-
-=item B<accents> - Takes an array ref full of characters that should be treated as accent marks. (TODO: discuss diff between punctuation & accents)
-
 =item B<canonizer> - Takes a subroutine ref.  The sub should take a string and return a string.  If defined, it will be called to produce a canonical form of the string in question.  Useful for getting rid of ligatures, un-composing characters, correcting common spelling mistakes, etc.
 
 =back
+
+=begin testing
+
+use Text::TEI::Collate;
+
+my $aligner = Text::TEI::Collate->new();
+
+is( ref( $aligner ), 'Text::TEI::Collate', "Got a Collate object from new()" );
+
+=end testing
 
 =cut
 
 # Set the options.  Main option is a pointer to the fuzzy matching algorithm
 # that the user wishes to use.
 sub new {
-    my $proto = shift;
-    my $class = ref( $proto ) || $proto;
-    my %opts = @_;
-    my $self = {
-	debug => 0,
-	distance_sub => undef,
-	fuzziness => { 'val' => 40, 'short' => 6, 'shortval' => 50 },
-	binmode => 'utf8',
-	punct_as_word => 0,
-	not_punct => [],
-	accents => [],
-	# TODO make this all come from one language module.
-	canonizer => undef,
-	comparator => undef,
-	%opts,
-    };
-    
-    unless( defined $self->{distance_sub} ) {
-	# Use the default.
-	my $rc = eval { require Text::WagnerFischer };
-	if( $rc ) {
-	    $self->{distance_sub} = &Text::WagnerFischer::distance;
-	} else {
-	    warn "No edit distance subroutine passed; default Text::WagnerFischer::distance unavailable.  Cannot initialize collator.";
-	    return undef;
+	my $proto = shift;
+	my $class = ref( $proto ) || $proto;
+	my %opts = @_;
+ 	my $self = {
+		debug => 0,
+		distance_sub => undef,
+		fuzziness => { 'val' => 40, 'short' => 6, 'shortval' => 50 },
+		binmode => 'utf8',
+		%opts,
+	};
+	
+	unless( defined $self->{distance_sub} ) {
+		# Use the default.
+		my $rc = eval { require Text::WagnerFischer };
+		if( $rc ) {
+ 			$self->{distance_sub} = \&Text::WagnerFischer::distance;
+		} else {
+			warn "No edit distance subroutine passed; default Text::WagnerFischer::distance unavailable.  Cannot initialize collator.";
+			return undef;
+		}
 	}
-    }
-        
-    if( my $b = $self->{'binmode'} ) {
-	binmode STDERR, ":$b";
-    }
     
-    bless $self, $class;
-    return $self;
-
+	if( my $b = $self->{'binmode'} ) {
+		binmode STDERR, ":$b";
+	}
+	
+ 	bless $self, $class;
+	return $self;
 }
-    
+
+=head2 read_source
+
+Pass in a word source (a plaintext file, a TEI XML file, or a JSON structure) 
+and a set of options, and get back one or more manuscript objects that can be 
+collated.  Options include:
+
+=over
+
+=item B<canonizer> - reference to a subroutine that returns the canonized (e.g. spell-
+corrected) form of the original word.
+
+=item B<comparator> - reference to a subroutine that returns the normalized comparison
+string (e.g. all lowercase, no accents) for a word.
+
+=item B<encoding> - The encoding of the word source if we are reading from a file.  
+Defaults to utf-8.
+
+=item B<sigil> - The sigil that should be assigned to this manuscript in the collation 
+output.  Should be a valid XML attribute value.  This can also be read from a
+TEI XML source.
+
+=item B<identifier> - A string to identify this manuscript (e.g. library, MS number).
+Can also be read from a TEI <msdesc/> element.
+
+=back
+
+=begin testing
+
+use lib 't/lib';
+use XML::LibXML;
+use Words::Armenian;
+
+my $aligner = Text::TEI::Collate->new();
+
+# Test a manuscript with a plaintext source, filename
+
+my @mss = $aligner->read_source( 't/data/plaintext/test1.txt',
+	'identifier' => 'plaintext 1',
+	'canonizer' => \&Words::Armenian::canonize_word,
+	);
+is( scalar @mss, 1, "Got a single object for a plaintext file");
+my $ms = pop @mss;
+	
+is( ref( $ms ), 'Text::TEI::Collate::Manuscript', "Got manuscript object back" );
+is( $ms->sigil, 'A', "Got correct sigil A");
+is( scalar( @{$ms->words}), 181, "Got correct number of words in A");
+
+# Test a manuscript with a plaintext source, string
+open( T2, "t/data/plaintext/test2.txt" ) or die "Could not open test file";
+my @lines = <T2>;
+close T2;
+@mss = $aligner->read_source( join( '', @lines ),
+	'identifier' => 'plaintext 2',
+	'canonizer' => \&Words::Armenian::canonize_word,
+	);
+is( scalar @mss, 1, "Got a single object for a plaintext string");
+$ms = pop @mss;
+
+is( ref( $ms ), 'Text::TEI::Collate::Manuscript', "Got manuscript object back" );
+is( $ms->sigil, 'B', "Got correct sigil B");
+is( scalar( @{$ms->words}), 183, "Got correct number of words in B");
+is( $ms->identifier, 'plaintext 2', "Got correct identifier for B");
+
+# Test two manuscripts with a JSON source
+open( JS, "t/data/json/testwit.json" ) or die "Could not read test JSON";
+@lines = <JS>;
+close JS;
+@mss = $aligner->read_source( join( '', @lines ),
+	'canonizer' => \&Words::Armenian::canonize_word,
+	);
+is( scalar @mss, 2, "Got two objects from the JSON string" );
+is( ref( $mss[0] ), 'Text::TEI::Collate::Manuscript', "Got manuscript object 1");
+is( ref( $mss[1] ), 'Text::TEI::Collate::Manuscript', "Got manuscript object 2");
+is( $mss[0]->sigil, 'MsAJ', "Got correct sigil for ms 1");
+is( $mss[1]->sigil, 'MsBJ', "Got correct sigil for ms 2");
+is( scalar( @{$mss[0]->words}), 182, "Got correct number of words in ms 1");
+is( scalar( @{$mss[1]->words}), 263, "Got correct number of words in ms 2");
+is( $mss[0]->identifier, 'JSON 1', "Got correct identifier for ms 1");
+is( $mss[1]->identifier, 'JSON 2', "Got correct identifier for ms 2");
+
+# Test a manuscript with an XML source
+@mss = $aligner->read_source( 't/data/xml_plain/test3.xml',
+	'canonizer' => \&Words::Armenian::canonize_word,
+	);
+is( scalar @mss, 1, "Got a single object from XML file" );
+$ms = pop @mss;
+
+is( ref( $ms ), 'Text::TEI::Collate::Manuscript', "Got manuscript object back" );
+is( $ms->sigil, 'BL5260', "Got correct sigil BL5260");
+is( scalar( @{$ms->words}), 178, "Got correct number of words in MsB");
+is( $ms->identifier, 'London OR 5260', "Got correct identifier for MsB");
+
+my $parser = XML::LibXML->new();
+my $doc = $parser->parse_file( 't/data/xml_plain/test3.xml' );
+@mss = $aligner->read_source( $doc,
+	'canonizer' => \&Words::Armenian::canonize_word,
+	);
+is( scalar @mss, 1, "Got a single object from XML object" );
+$ms = pop @mss;
+
+is( ref( $ms ), 'Text::TEI::Collate::Manuscript', "Got manuscript object back" );
+is( $ms->sigil, 'BL5260', "Got correct sigil BL5260");
+is( scalar( @{$ms->words}), 178, "Got correct number of words in MsB");
+is( $ms->identifier, 'London OR 5260', "Got correct identifier for MsB");
+
+## The mss we will test the rest of the tests with.
+@mss = $aligner->read_source( 't/data/cx/john18-2.xml' );
+is( scalar @mss, 28, "Got correct number of mss from CX file" );
+my %wordcount = (
+	'base' => 57,
+	'P60' => 20,
+	'P66' => 55,
+	'w1' => 58,
+	'w11' => 57,
+	'w13' => 58,
+	'w17' => 58,
+	'w19' => 57,
+	'w2' => 58,
+	'w21' => 58,
+	'w211' => 54,
+	'w22' => 57,
+	'w28' => 57,
+	'w290' => 46,
+	'w3' => 56,
+	'w30' => 59,
+	'w32' => 58,
+	'w33' => 57,
+	'w34' => 58,
+	'w36' => 58,
+	'w37' => 56,
+	'w38' => 57,
+	'w39' => 58,
+	'w41' => 58,
+	'w44' => 56,
+	'w45' => 58,
+	'w54' => 57,
+	'w7' => 57,
+);
+foreach( @mss ) {
+	is( scalar @{$_->words}, $wordcount{$_->sigil}, "Got correct number of words for " . $_->sigil );
+}
+
+=end testing
+
+=cut 
+
+sub read_source {
+	my( $self, $wordsource, %options ) = @_;
+	my @docroots;  # Holds an array of { sigil, source }
+	my $format;
+	
+	if( !ref( $wordsource ) ) {  # Assume it's a filename.
+		my $parser = XML::LibXML->new();
+		my $doc;
+		eval { local $SIG{__WARN__} = sub { 1 }; $doc = $parser->parse_file( $wordsource ); };
+		if( $doc ) {
+			( $format, @docroots) = _get_xml_roots( $doc );
+			return unless @docroots;
+		} else {
+			# It's not an XML document filename.  Determine plaintext
+			# filename, plaintext string, or JSON string.
+			my $encoding = delete $options{'binmode'};
+			$encoding ||= 'utf8';
+			my $binmode = "<:" . $encoding;
+			my $rc = open( INFILE, $binmode, $wordsource );
+			$format = 'plaintext';
+			if( $rc ) {
+				# It is a filename, thus plaintext.
+				my @lines = <INFILE>;
+				close INFILE;
+				@docroots = ( { source => join( '', @lines ) } );
+			} else {
+				my $json;
+				eval { $json = decode_json( $wordsource ) };
+				if( $json ) {
+					# It is a JSON string.
+					$format = 'json';
+					push( @docroots, map { { source => $_ } } @{$json->{'witnesses'}} );
+				} else {
+					# Assume plain old string input.
+					@docroots = ( { source => $wordsource } );
+				}
+			}
+		}
+	} elsif ( ref( $wordsource ) eq 'XML::LibXML::Document' ) { # A LibXML object
+		( $format, @docroots ) = _get_xml_roots( $wordsource );
+	} else {   
+		warn "Unrecognized object $wordsource; reading no words";
+		return ();
+	}
+
+	# We have the representations of the manuscript(s).  Initialize our object(s).
+	my @ms_objects;
+	foreach my $doc ( @docroots ) {
+		push( @ms_objects, Text::TEI::Collate::Manuscript->new( 
+			'sourcetype' => $format,
+			%options,
+			%$doc,
+			) );
+	}
+	return @ms_objects;
+}
+
+sub _get_xml_roots {
+	my( $xmldoc ) = @_;
+	my( @docroots, $format );
+	if( $xmldoc->documentElement->nodeName =~ /^tei/i ) {
+		# It is TEI format.
+		@docroots = ( { source => $xmldoc->documentElement } );
+		$format = 'xmldesc';
+	} elsif( $xmldoc->documentElement->nodeName =~ /^examples/i ) {
+		# It is CollateX simple input format.  Read the text
+		# strings and then treat it as plaintext.
+		my @collationtexts = $xmldoc->documentElement->getChildrenByTagName( 'example' );
+		if( @collationtexts ) {
+			# Use the first text example in the file; we do not handle multiple
+			# collation runs on different texts.
+			my @witnesses = $collationtexts[0]->getChildrenByTagName( 'witness' );
+			@docroots = map { { sigil => $_->getAttribute( 'id' ),
+								source => $_->textContent } } @witnesses;
+			$format = 'plaintext';
+		} else {
+			warn "Found no example elements in CollateX XML";
+			return ();
+		}
+	} else {
+		# Uh-oh, it is not a TEI or CollateX sort of document.
+		warn "Cannot parse XML document type " 
+			. $xmldoc->documentElement->nodeName . "; reading no words";
+		return ();
+	}
+	return( $format, @docroots );  # TODO Stop the autosigil of CX files
+}
+
 =head2 align
 
-This is the meat of the program.  Takes a list of strings, or a list
-of IO::File objects.  (The latter is useful if the text you are
-collating is particularly long.)  Returns a list of collated texts.
-Currently each "text" is simply a list of words, padded for collation
-with empty strings; soon it will be a list of word objects which I
-have yet to describe.
+The meat of the program.  Takes a list of Text::TEI::Collate::Manuscript 
+objects (created by new_manuscript above.)  Returns the same objects with 
+their wordlists collated. 
+
+=begin testing
+
+my $aligner = Text::TEI::Collate->new();
+my @mss = $aligner->read_source( 't/data/cx/john18-2.xml' );
+$aligner->align( @mss );
+my $cols = 106;
+foreach( @mss ) {
+	is( scalar @{$_->words}, $cols, "Got correct collated columns for " . $_->sigil);
+}
+
+#TODO test the actual collation validity sometime
+
+=end testing
 
 =cut
 
-# align - Main function.
-# Takes a list of strings, or a list of filehandles.  Returns a list
-# of aligned word arrays.
-
 sub align {
-    my( $self, @texts ) = @_;
-
-    my @manuscripts;
-    foreach ( @texts ) {
-	# Break down each text into word-object arrays.
-	push( @manuscripts, $self->read_manuscript_source( $_ ) );
-    }
+    my( $self, @manuscripts ) = @_;
 
     # This will hold many arrays, one for each collated text.  Each member
     # array will be a list of word objects.  We will eventually return it.
@@ -331,7 +575,7 @@ sub generate_base {
 	                             # word, but just in case there is a
 	                             # gap, it should be the right object.
 	foreach my $col ( 0 .. $width - 1 ) {
-	    if( $texts[$col]->[$idx]->comparison_form() ne '' ) {
+	    if( $texts[$col]->[$idx]->comparison_form ne '' ) {
 		$word = $texts[$col]->[$idx];
 		$word->is_base( 1 );
 		last;
@@ -344,69 +588,6 @@ sub generate_base {
     }
     
     return \@new_base;
-}
-
-# Take a word source and convert it into a manuscript object with a
-# list of word objects.  The following sources are supported:
-# - plaintext files
-# - XML::LibXML::Documents
-
-sub read_manuscript_source {
-    my $self = shift;
-    my $wordsource = shift;
-
-    my @words;
-
-    # The wordsource should either be a filename or an
-    # XML::LibXML::Document.
-
-    my $docroot;
-    
-    # Now we have either a filehandle or an XML doc.
-    if( !ref( $wordsource ) ) {  # Assume it's a filename.
-	if( $self->{'TEI'} ) {
-	    my $parser = XML::LibXML->new();
-	    my $doc;
-	    eval { $doc = $parser->parse_file( $wordsource ); };
-	    unless( $doc ) {
-		warn "Failed to parse file $wordsource into valid XML; reading no words";
-		return @words;
-	    }
-	    $docroot = $doc->documentElement;
-	} else {
-	    # It's a plaintext file.  Put it all in a string.
-	    my $binmode = "<:" . $self->{'binmode'};
-	    my $rc = open( INFILE, $binmode, $wordsource );
-	    unless( $rc ) {
-		warn "Failed to open file $wordsource; reading no words";
-		return @words;
-	    }
-	    my @lines = <INFILE>;
-	    close INFILE;
-	    $docroot = join( '', @lines );
-	}
-    } elsif ( ref( $wordsource ) eq 'XML::LibXML::Document' ) { # A LibXML object
-	$docroot = $wordsource->getDocumentRoot;
-	if( $docroot->nodeName eq 'TEI' ) {
-	    # If we have been passed a TEI XML object, it's fair to assume 
-	    # the user wants TEI parsing.
-	    $self->{'TEI'} = 1;
-	}
-    } else {   
-	warn "Unrecognized object $wordsource; reading no words";
-	return @words;
-    }
-
-    # We have the XML doc.  Get the manuscript data out.
-    my $parse_input = $self->{'TEI'} ? 'xmldesc' : 'plaintext';
-    my $ms_obj = Text::TEI::Collate::Manuscript->new( 
-	'type' => $parse_input,
-	'source' => $docroot,
-	'canonizer' => $self->{'canonizer'},
-	'comparator' => $self->{'comparator'},
-	);
-    
-    return $ms_obj;
 }
 
 # link_words: Another example of my startling inefficiency.  Build
@@ -941,6 +1122,462 @@ sub _return_alpha_string {
 	$idx = int( $idx / 26 );
     }
     return scalar( reverse @chars );
+}
+
+=head1 OUTPUT METHODS
+
+=head2 to_json
+
+Takes a list of aligned manuscripts and returns a data structure suitable for 
+JSON encoding; documented at L<http://gregor.middell.net/collatex/api/collate>
+
+=begin testing
+
+my $aligner = Text::TEI::Collate->new();
+my @mss = $aligner->read_source( 't/data/cx/john18-2.xml' );
+$aligner->align( @mss );
+my $jsondata = $aligner->to_json( @mss );
+ok( exists $jsondata->{alignment}, "to_json: Got alignment data structure back");
+my @wits = @{$jsondata->{alignment}};
+is( scalar @wits, 28, "to_json: Got correct number of witnesses back");
+my $columns = 106;
+foreach ( @wits ) {
+	is( scalar @{$_->{tokens}}, $columns, "to_json: Got correct number of words back for witness")
+}
+
+=end testing
+
+=cut
+
+sub to_json {
+	my( $self, @mss ) = @_;
+	my $result = { 'alignment' => [] };
+	foreach my $ms ( @mss ) {
+		push( @{$result->{'alignment'}},
+			  { 'witness' => $ms->sigil,
+				'tokens' => $ms->tokenize_as_json()->{'tokens'}, } );
+	}
+	return $result;
+}
+
+=head2 to_tei
+
+Takes a list of aligned Manuscript objects and returns a fairly simple TEI 
+XML document in parallel segmentation format, with the words lexically marked 
+as such.  At the moment returns a single paragraph, with the original div and
+paragraph breaks for each witness marked as a <witDetail/> in the apparatus.
+
+=begin testing
+
+use lib 't/lib';
+use Text::TEI::Collate;
+use Text::WagnerFischer::Armenian;
+use Words::Armenian;
+use XML::LibXML::XPathContext;
+# Get an alignment to test with
+my $testdir = "t/data/xml_plain";
+opendir( XF, $testdir ) or die "Could not open $testdir";
+my @files = readdir XF;
+my @mss;
+my $aligner = Text::TEI::Collate->new(
+	'fuzziness' => '50',
+	'distance_sub' => \&Text::WagnerFischer::Armenian::distance,
+	);
+foreach ( sort @files ) {
+	next if /^\./;
+	push( @mss, $aligner->read_source( "$testdir/$_",
+		'canonizer' => \&Words::Armenian::canonize_word
+		) );
+}
+$aligner->align( @mss );
+
+my $doc = $aligner->to_tei( @mss );
+is( ref( $doc ), 'XML::LibXML::Document', "Made TEI document header" );
+my $xpc = XML::LibXML::XPathContext->new( $doc->documentElement );
+$xpc->registerNs( 'tei', $doc->documentElement->namespaceURI );
+
+# Test the creation of a document header from TEI files
+my @witdesc = $xpc->findnodes( '//tei:witness/tei:msDesc' );
+is( scalar @witdesc, 5, "Found five msdesc nodes");
+
+# Test the creation of apparatus entries
+my @apps = $xpc->findnodes( '//tei:app' );
+is( scalar @apps, 106, "Got the correct number of app entries");
+my @words_not_in_app = $xpc->findnodes( '//tei:body/tei:div/tei:p/tei:w' );
+is( scalar @words_not_in_app, 182, "Got the correct number of matching words");
+my @details = $xpc->findnodes( '//tei:witDetail' );
+my @detailwits;
+foreach ( @details ) {
+	my $witstr = $_->getAttribute( 'wit' );
+	push( @detailwits, split( /\s+/, $witstr ));
+}
+is( scalar @detailwits, 13, "Found the right number of witness-detail wits");
+
+# TODO test the reconstruction of witnesses from the parallel-seg.
+
+=end testing
+
+=cut
+
+## Block for to_tei logic
+{
+	##  Counter variables
+	my $app_id_ctr = 0;  # for xml:id of <app/> tags
+	my $word_id_ctr = 0; # for xml:id of <w/> tags that have witDetails
+	
+	## Constants
+	my $ns_uri = 'http://www.tei-c.org/ns/1.0';
+	# Local globals
+	my ( $doc, $body );
+
+	sub to_tei {
+		my( $self, @mss ) = @_;
+		( $doc, $body ) = _make_tei_doc( @mss );
+		##  Generate a base by flattening all the results                               
+		my $initial_base = $self->generate_base( map { $_->words } @mss );
+		foreach my $idx ( 0 .. $#{$initial_base} ) {
+			my %seen;
+			map { $seen{$_->sigil} = 0 } @mss;
+			_make_tei_app( $initial_base->[$idx], %seen );
+		}
+
+		return $doc;
+	}
+	
+	sub _make_tei_doc {
+		my @mss = @_;
+		my $doc = XML::LibXML->createDocument( '1.0', 'UTF-8' );
+		my $root = $doc->createElementNS( $ns_uri, 'TEI' );
+
+		# Make the header
+		my $teiheader = $root->addNewChild( $ns_uri, 'teiHeader' );
+		my $filedesc = $teiheader->addNewChild( $ns_uri, 'fileDesc' );
+		$filedesc->addNewChild( $ns_uri, 'titleStmt' )->
+			addNewChild( $ns_uri, 'title' )->
+			appendText( 'this is a title' );
+		$filedesc->addNewChild( $ns_uri, 'publicationStmt' )->
+			addNewChild( $ns_uri, 'p' )->
+			appendText( 'this is a publication statement' );
+		my $witnesslist = $filedesc->addNewChild( $ns_uri, 'sourceDesc')->
+			addNewChild( $ns_uri, 'listWit' );
+		foreach my $m ( @mss ) {
+			my $wit = $witnesslist->addNewChild( $ns_uri, 'witness' );
+			$wit->setAttribute( 'xml:id', $m->sigil );
+			if( $m->has_msdesc ) {
+				my $local_msdesc = $m->msdesc->cloneNode( 1 );
+				$local_msdesc->removeAttribute( 'xml:id' );
+				$wit->appendChild( $local_msdesc );
+			} else {
+				$wit->appendText( $m->identifier );
+			}
+		}
+
+		# Make the body element
+		my $body_p = $root->addNewChild( $ns_uri, 'text' )->
+			addNewChild( $ns_uri, 'body' )->
+			addNewChild( $ns_uri, 'div' )->
+			addNewChild( $ns_uri, 'p' );  # TODO maybe this should be lg?
+
+		# Set the root...
+		$doc->setDocumentElement( $root );
+		# ...and return the doc and the body
+		return( $doc, $body_p );
+	}
+
+	sub _make_tei_app {
+		my( $word_obj, %seen ) = @_;
+		my @all_words = ( $word_obj, $word_obj->links, $word_obj->variants );
+		foreach( $word_obj->variants ) {
+			push( @all_words, $_->links );
+		}
+		# Do we have the exact same word across all manuscripts with no pesky
+		# placeholders?  And which manuscripts have words?
+		my $variation = 0;
+		foreach( @all_words ) {
+			$variation = 1 if $_->original_form ne $word_obj->original_form;
+			# We need an <app/> tag if there is a placeholder to record too.
+			$variation = 1 if $_->placeholders;
+			$seen{$_->ms_sigil} = 1 if $_->ms_sigil;
+		}
+		# If we do have variation, we create an <app/> element to describe 
+		# it.  If we don't, we create a <w/> element to hold the common word.
+		if( $variation ) {
+			my $app_el = $body->addNewChild( $ns_uri, 'app');
+			$app_el->setAttribute( 'xml:id', 'app'.$app_id_ctr++ );
+			# We want only one reading per unique original_form.
+			my %forms;
+			foreach my $rdg ( @all_words ) {
+				my $rdgkey = $rdg->original_form;
+				next unless $rdgkey;
+				push( @{$forms{$rdgkey}}, $rdg );
+			}
+			# Now for each form, go through and get the reading witnesses and
+			# placeholders.
+			foreach my $form ( keys %forms ) {
+				my $rdg_el = $app_el->addNewChild( $ns_uri, 'rdg' );
+				# Set the witness string.
+				my $wit_str = join( ' ', map { '#'.$_->ms_sigil } @{$forms{$form}});
+				$rdg_el->setAttribute( 'wit', $wit_str );
+				# Set the word element within the reading.
+				my $w_el = $rdg_el->addNewChild( $ns_uri, 'w' );
+				$w_el->setAttribute( 'xml:id', 'w'.$word_id_ctr++ );
+				# Arbitrarily use the first reading of this form to get the punctuation.
+				_wrap_punct( $w_el, $forms{$form}->[0] );
+				# Add the placeholder information as <witDetail/> elements.
+				my $witDetails;
+				foreach my $rdg ( @{$forms{$form}} ) {
+					foreach my $pl ( $rdg->placeholders ) {
+						push( @{$witDetails->{'#'.$w_el->getAttribute( 'xml:id' )}->{$pl}}, '#'.$rdg->ms_sigil );
+					}
+				}
+				foreach my $wd ( keys %$witDetails ) {
+					foreach my $type ( keys %{$witDetails->{$wd}} ) {
+						my $wd_el = $app_el->addNewChild( $ns_uri, 'witDetail' );
+						$wd_el->setAttribute( 'target', $wd );
+						$wd_el->setAttribute( 'wit', join( ' ', @{$witDetails->{$wd}->{$type}}) );
+						$wd_el->appendText( $type );
+					}
+				}
+			}
+			my @empty = grep { $seen{$_} == 0 } keys( %seen );
+			if( @empty ) {
+				my $rdg_el = $app_el->addNewChild( $ns_uri, 'rdg' );
+				my $wit_str = join( ' ', map { '#'.$_ } @empty );
+				$rdg_el->setAttribute( 'wit', $wit_str );
+			}
+		} else {
+			# No variation across manuscripts, just make a <w/> and use the initial
+			# $word_obj to represent all mss.
+			my $w_el = $body->addNewChild( $ns_uri, 'w');
+			$w_el->setAttribute( 'xml:id', 'w'.$word_id_ctr++ );
+			_wrap_punct( $w_el, $word_obj );
+		}
+	}
+	
+	sub _wrap_punct {
+		my( $w_el, $word_obj ) = @_;
+		my $str = $word_obj->original_form;
+		my @punct = $word_obj->punctuation;
+		my $last_pos = -1;
+		foreach my $p ( @punct ) {
+			my @letters = split( '', $str );
+			if( $p->{char} eq $letters[$p->{pos}] ) {
+				my @wordpart = @letters[$last_pos+1..$p->{pos}-1];
+				$w_el->appendText( join( '', @wordpart ) );
+				my $char = $w_el->addNewChild( $ns_uri, 'c');
+				$char->setAttribute( "type", "punct" );
+				$char->appendText( $p->{char} );
+				$last_pos = $p->{pos};
+			} else {
+				warn "Punctuation mismatch: " . join( '/', $p->{char}, 
+					$p->{pos} ) . " on " . $str;
+			}
+		}
+		# Now append what is left of the word after the last punctuation.
+		if( $last_pos < length( $str ) - 1 ) {
+			my @letters = split( '', $str );
+			my @wordpart = @letters[$last_pos+1..$#letters];
+			$w_el->appendText( join( '', @wordpart ) );
+		}
+		return $w_el;
+	}
+
+}
+
+=head2 to_graphml
+
+Takes a list of aligned manuscript objects and returns a GraphML document that
+represents the collation as a variant graph. Words in the same location with
+the same canonized form are treated as the same node.
+
+=cut
+
+sub to_graphml {
+	my( $self, @manuscripts ) = @_;
+	my $graph = $self->to_graph( @manuscripts );
+	
+	# Make the XML doc
+	my $GMLNS = 'http://graphml.graphdrawing.org/xmlns';
+	my $graphml = XML::LibXML::Document->new('1.0', 'UTF-8');
+	my $root = $graphml->createElementNS( $GMLNS, 'graphml' );
+	$root->setNamespace( 'http://www.w3.org/2001/XMLSchema-instance', 'xsi', 0 );
+	$root->setAttribute( 'xsi:schemaLocation', 'http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd');
+	
+	# Make the interminable graph header
+	my $graph_el = $root->addNewChild( $GMLNS, 'graph' );
+	$graph_el->setAttribute( 'id', 'G' );
+	$graph_el->setAttribute( 'edgedefault', 'directed' );
+	my $nkey = $graph_el->addNewChild( $GMLNS, 'key' );
+	$nkey->setAttribute( 'attr.name', 'number' );
+	$nkey->setAttribute( 'attr.type', 'string' );
+	$nkey->setAttribute( 'for', 'node' );
+	$nkey->setAttribute( 'id', 'd0' );
+	my $tkey = $graph_el->addNewChild( $GMLNS, 'key' );
+	$tkey->setAttribute( 'attr.name', 'token' );
+	$tkey->setAttribute( 'attr.type', 'string' );
+	$tkey->setAttribute( 'for', 'node' );
+	$tkey->setAttribute( 'id', 'd1' );
+	my $ms_ctr = 0;
+	my %ms_key;
+	foreach my $ms ( @manuscripts ) {
+		my $wkey = $graph_el->addNewChild( $GMLNS, 'key' );
+		$wkey->setAttribute( 'attr.name', $ms->sigil );
+		$wkey->setAttribute( 'attr.type', 'string' );
+		$wkey->setAttribute( 'for', 'edge' );
+		$wkey->setAttribute( 'id', 'w'.$ms_ctr++ );
+		$ms_key{$ms->sigil} = $wkey->getAttribute( 'id' );
+	}
+	
+	# Whew.  Now add all the nodes
+	foreach my $n ( $graph->nodes ) {
+		my $node_el = $graph_el->addNewChild( $GMLNS, 'node' );
+		$node_el->setAttribute( 'id', $n->name );
+		my $id_el = $node_el->addNewChild( $GMLNS, 'data' );
+		$id_el->setAttribute( 'key', 'd0' );
+		$id_el->appendText( $n->name );
+		my $token_el = $node_el->addNewChild( $GMLNS, 'data' );
+		$token_el->setAttribute( 'key', 'd1' );
+		$token_el->appendText( $n->label );
+	}
+	
+	# Finally, add the edges.
+	my $edge_ctr = 0;
+	foreach my $n ( $graph->nodes ) {
+		foreach my $succ ( $n->successors() ) {
+			my $edge_el = $graph_el->addNewChild( $GMLNS, 'edge' );
+			$edge_el->setAttribute( 'id', 'e'.$edge_ctr++ );
+			$edge_el->setAttribute( 'source', $n->name );
+			$edge_el->setAttribute( 'target', $succ->name );
+			foreach my $edge ( $n->edges_to( $succ ) ) {
+				# The edge label is the sigil.  Add a data key for that sigil.
+				my $sig = $edge->name;
+				my $sig_el = $edge_el->addNewChild( $GMLNS, 'data' );
+				$sig_el->setAttribute( 'key', $ms_key{$sig} );
+				$sig_el->appendText( $sig );
+			}
+		}
+	}
+	$graphml->setDocumentElement( $root );
+	return $graphml;
+}
+
+=head2 to_svg
+
+Takes a list of aligned manuscript objects and returns an SVG representation
+of the variant graph, as described for the to_graphml method.
+
+=cut
+
+sub to_svg {
+	my( $self, @mss ) = @_;
+	my $graph = $self->to_graph( @mss );
+	$graph->set_attribute( 'node', 'shape', 'ellipse' );
+	_combine_edges( $graph );
+	my $dot = $graph->as_graphviz();
+	my @cmd = qw/dot -Tsvg/;
+    my( $svg, $err );
+    run( \@cmd, \$dot, ">", binary(), \$svg );
+    return $svg;    
+}
+
+sub _combine_edges {
+	my $graph = shift;
+	foreach my $n ( $graph->nodes ) {
+		foreach my $s ( $n->successors ) {
+			my @edges = $n->edges_to( $s );
+			my $new_edge = join( ', ', map { $_->name } @edges );
+			map { $graph->del_edge( $_ ) } @edges;
+			$graph->add_edge( $n, $s, $new_edge );
+		}
+	}
+}
+
+=head2 to_graph
+
+Base method for graph-based output - create the (Graph::Easy) graph that will
+be used to generate graphml or svg.
+
+=begin testing
+
+use lib 't/lib';
+use Text::TEI::Collate;
+use Text::WagnerFischer::Armenian;
+use Words::Armenian;
+use XML::LibXML::XPathContext;
+# Get an alignment to test with
+my $testdir = "t/data/xml_plain";
+opendir( XF, $testdir ) or die "Could not open $testdir";
+my @files = readdir XF;
+my @mss;
+my $aligner = Text::TEI::Collate->new(
+	'fuzziness' => '50',
+	'distance_sub' => \&Text::WagnerFischer::Armenian::distance,
+	);
+foreach ( sort @files ) {
+	next if /^\./;
+	push( @mss, $aligner->read_source( "$testdir/$_",
+		'canonizer' => \&Words::Armenian::canonize_word
+		) );
+}
+$aligner->align( @mss );
+
+my $graph = $aligner->to_graph( @mss );
+
+is( ref( $graph ), 'Graph::Easy', "Got a graph object from to_graph" );
+is( scalar( $graph->nodes ), 381, "Got the right number of nodes" );
+is( scalar( $graph->edges ), 992, "Got the right number of edges" );
+
+=end testing
+
+=cut
+
+sub to_graph {
+	my( $self, @manuscripts ) = @_;
+	my $rc = eval { require Graph::Easy; };
+	unless( $rc ) {
+		warn "Cannot generate variant graph without installation of Graph::Easy package";
+		return;
+	}
+	my $graph = Graph::Easy->new();
+	# All manuscripts run from START to END.
+	my $start_node = $graph->add_node( 'n0' );
+	$start_node->set_attribute( 'label', '#START#');
+	my $end_node = $graph->add_node( 'n1' );
+	$end_node->set_attribute( 'label', '#END#');
+	my $textlen = $#{$manuscripts[0]->words};
+	my $paths = {};  # A list of nodes per manuscript sigil.
+	$DB::single = 1;
+	my $node_counter = 2;  # We've used n0 and n1 already
+	foreach my $idx ( 0..$textlen ) {
+		my $unique_words;
+		my @location_words = map { $_->words->[$idx] } @manuscripts;
+		foreach my $w ( @location_words ) {
+			if( $w->special && $w->special eq 'BEGIN' ) {
+				$paths->{$w->ms_sigil} = [ $start_node ];
+			} elsif( $w->special && $w->special eq 'END' ) {
+				push( @{$paths->{$w->ms_sigil}}, $end_node );
+			} elsif( !$w->is_empty && !$w->special ) {
+				push( @{$unique_words->{$w->canonical_form}}, $w->ms_sigil )
+			}
+		}
+		foreach my $w ( keys %$unique_words ) {
+			# Make the node.
+			my $n = $graph->add_node( 'n'.$node_counter++ );
+			$n->set_attribute( 'label', $w );
+			foreach my $sig ( @{$unique_words->{$w}} ) {
+				push( @{$paths->{$sig}}, $n );
+			}
+		}
+	}
+	# Have the nodes, now make the edges.
+	foreach my $sig ( keys %$paths ) {
+		my $from = shift @{$paths->{$sig}};
+		foreach my $to ( @{$paths->{$sig}} ) {
+			$graph->add_edge( $from, $to, $sig );
+			$from = $to;
+		}
+	}
+	return $graph;
 }
 
 ## Print a debugging message.
