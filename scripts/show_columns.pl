@@ -5,16 +5,16 @@ use lib 'lib';
 use Data::Dumper;
 use Getopt::Long;
 use Storable qw( store_fd retrieve );
-use Text::WagnerFischer::Armenian;
+#use Text::WagnerFischer::Armenian;
 use Text::TEI::Collate;
-use Words::Armenian;
+#use Words::Armenian;
 
 binmode STDOUT, ":utf8";
 binmode STDERR, ":utf8";
 eval { no warnings; binmode $DB::OUT, ":utf8"; };
 
 # Default option values
-my( $col_width, $fuzziness ) = ( 25, 50 );
+my( $col_width, $fuzziness, $language ) = ( 25, 50, 'Default' );
 my( $CSV, $storable, $outfile, $infile, $text, $cx, $json, $debug, %argspec );
 
 GetOptions( 'csv' => \$CSV,
@@ -28,6 +28,7 @@ GetOptions( 'csv' => \$CSV,
 	    'debug:i' => \$debug,
 	    'argspec=s' => \%argspec,
 	    'fuzziness=i' => \$fuzziness,
+	    'l|language=s' => \$language,
     );
 
 ## Option checking
@@ -52,7 +53,7 @@ my $fuzzy_hash = { 'short' => 6, 'shortval' => 50 };
 $fuzzy_hash->{'val'} = $fuzziness;
 
 unless( keys %argspec ) {
-    %argspec = ( 'word' => 'first', 'sliding' => 0, 'inclusive' => 0 );
+    %argspec = ( 'word' => 'shorter', 'sliding' => 0, 'inclusive' => 0 );
 }
 
 ## Get busy. 
@@ -67,7 +68,7 @@ if( $json ) {  # The 'file' is the JSON string.
 
 my $aligner = Text::TEI::Collate->new( 'fuzziness_sub' => \&fuzzy_match,
 				       'debug' => $debug,
-				       'distance_sub' => \&Text::WagnerFischer::Armenian::distance,
+				       'language' => $language,
     );
 
 
@@ -80,9 +81,7 @@ if( $infile ) {
     @files = map { $_->sigil } @mss;
 } else {
     foreach ( @files ) {
-	push( @mss, $aligner->read_source( $_,
-	      canonizer => \&Words::Armenian::canonize_word,
-	      comparator => \&Words::Armenian::comparator ) );
+	push( @mss, $aligner->read_source( $_ ) );
     }
     $aligner->align( @mss );
     if( $cx || $json ) {

@@ -1,13 +1,15 @@
 package Text::TEI::Collate::Manuscript;
 
-use vars qw( $VERSION %assigned_sigla );
+use vars qw( $VERSION %assigned_sigla %tags );
 use Moose;
 use Moose::Util::TypeConstraints;
+use Text::TEI::Collate::Error;
 use Text::TEI::Collate::Word;
+use TryCatch;
 use XML::LibXML;
 use XML::Easy::Syntax qw( $xml10_name_rx );
 
-$VERSION = "1.0";
+$VERSION = "1.1";
 %assigned_sigla = ();
 
 subtype 'SourceType',
@@ -53,15 +55,11 @@ has 'sourcetype' => (
 	required => 1, 
 );
 
-has 'canonizer' => (
-	is => 'ro',
-	isa => 'CodeRef',
-);
-
-has 'comparator' => (
-	is => 'ro',
-	isa => 'CodeRef',
-);
+has 'language' => (
+    is => 'ro',
+    isa => 'Str',
+    default => 'Default',
+    );
 
 has 'source' => (  # Can be XML obj, JSON data struct, or string.
 	is => 'ro',
@@ -117,20 +115,29 @@ sub BUILD {
 sub _init_from_xmldesc {
 	my( $self, $xmlobj ) = @_;
 	unless( $xmlobj->nodeName eq 'TEI' ) {
-		warn "Manuscript initialization needs a TEI document!";
-		return;
+		throw( ident => "bad source", 
+		       message => "Source XML must be TEI (this is " . $xmlobj->nodeName . ")" );
 	}
-	# Get the identifier
+
+	# Set up the tags we need, with or without namespaces.
+	map { $tags{$_} = "//$_" } qw/ msDesc settlement repository idno p lg /;
+	# Set up our XPath object
 	my $xpc = XML::LibXML::XPathContext->new( $xmlobj );
-	$xpc->registerNs( 'tei', $xmlobj->namespaceURI );
+	# Use namespace-aware tags if we have to 
+	if( $xmlobj->namespaceURI ) {
+	    $xpc->registerNs( 'tei', $xmlobj->namespaceURI );
+	    map { $tags{$_} = "//tei:$_" } keys %tags;
+	}
 	$self->_set_xpc( $xpc );
-	if( my $desc = $xpc->find( '//tei:msDesc' ) ) {
+
+	# Get the identifier
+	if( my $desc = $xpc->find( $tags{msDesc} ) ) {
 		my $descnode = $desc->get_node(1);
 		$self->_save_msdesc( $descnode );
 		my( $setNode, $reposNode, $idNode ) =
-			( $xpc->find( '//tei:settlement' )->get_node(1),
-			  $xpc->find( '//tei:repository' )->get_node(1),
-			  $xpc->find( '//tei:idno' )->get_node(1) );
+			( $xpc->find( $tags{settlement} )->get_node(1),
+			  $xpc->find( $tags{repository} )->get_node(1),
+			  $xpc->find( $tags{idno} )->get_node(1) );
 		$self->settlement( $setNode ? $setNode->textContent : '' );
 		$self->repository( $reposNode ? $reposNode->textContent : '' );
 		$self->idno( $idNode ? $idNode->textContent : '' );
@@ -141,8 +148,8 @@ sub _init_from_xmldesc {
 		}
 		$self->identifier( join( ' ', $self->{'settlement'}, $self->{'idno'} ) );
 	} else {
-		warn "Could not find manuscript description in doc; creating generic manuscript";
-		$self->identifier( '==Unknown manuscript==' );
+	    throw( ident => "bad source",
+	           message => "Could not find manuscript description element in TEI header" );
 	}
 
 	# Now get the words out.
@@ -156,7 +163,8 @@ sub _init_from_xmldesc {
 	if( $teitext ) {
 		@words = _tokenize_text( $self, $teitext );
 	} else {
-		warn "No text in document '" . $self->{'identifier'} . "!";
+	    throw( ident => "bad source",
+	           message => "No text element in document '" . $self->{'identifier'} . "!" );
 	}
 	
 	$self->replace_words( \@words );
@@ -191,7 +199,8 @@ sub _read_paragraphs_or_lines {
 
 	my @words;
 	my $xpc = $self->_xpc;
- 	my @pgraphs = $xpc->findnodes( './/tei:p | .//tei:lg', $element );
+	my $xpexpr = '.' . $tags{p} . '|.' . $tags{lg};
+ 	my @pgraphs = $xpc->findnodes( $xpexpr, $element );
     return () unless @pgraphs;
 	foreach my $pg( @pgraphs ) {
 		# If this paragraph is the descendant of a note element,
@@ -200,7 +209,7 @@ sub _read_paragraphs_or_lines {
 		next if scalar @noop_container;
 		# If there are any #text nodes that are direct children of
 		# this paragraph, the whole thing needs to be processed.
-		if( my @textnodes = $xpc->findnodes( 'child::text()' ) ) {
+		if( my @textnodes = $xpc->findnodes( 'child::text()', $pg ) ) {
 			# We have to split the words by whitespace.
 			my $string = _get_text_from_node( $pg );
 			my @pg_words = $self->_split_words( $string );
@@ -222,7 +231,13 @@ sub _read_paragraphs_or_lines {
 			my $first_word = 1;
 			foreach my $c ( $pg->childNodes() ) {
 				# Trickier.  Need to parse the component tags.
-				my $text = _get_text_from_node( $c );
+				my $text;
+				try {
+    				$text = _get_text_from_node( $c );
+    			} catch( Text::TEI::Collate::Error $e 
+    			            where { $_->has_tag( 'lb' ) } ) {
+    			    next;
+    			}
 				unless( defined $text ) {
 					print STDERR "WARNING: no text in node " . $c->nodeName 
 						. "\n" unless $c->nodeName eq 'lb';
@@ -236,8 +251,7 @@ sub _read_paragraphs_or_lines {
 				foreach( @textwords ) {
 					my $w = Text::TEI::Collate::Word->new( 'string' => $_,
 						'ms_sigil' => $self->sigil,
-						'comparator' => $self->comparator,
-						'canonizer' => $self->canonizer );
+						'language' => $self->language );
 					if( $first_word ) {
 						$first_word = 0;
 						# Set the relevant sectioning markers 
@@ -261,53 +275,57 @@ sub _read_paragraphs_or_lines {
 # check it for lack of spaces.  
 
 sub _get_text_from_node {
-    my( $node ) = @_;
-    my $text = '';
-    # We can have an lb or pb in the middle of a word; if we do, the
-    # whitespace (including \n) after the break becomes insignificant
-    # and we want to nuke it.
-    my $strip_leading_space = 0; 
-    foreach my $c ($node->childNodes() ) {
-	if( $c->nodeName eq 'num' 
-	    && defined $c->getAttribute( 'value' ) ) {
-	    # Push the number.
-	    $text .= $c->getAttribute( 'value' );
-	    # If this is just after a line/page break, return to normal behavior.
-	    $strip_leading_space = 0;
-	} elsif ( $c->nodeName =~ /^[lp]b$/ ) {
-	    # Set a flag that strips leading whitespace until we
-	    # get to the next bit of non-whitespace.
-	    $strip_leading_space = 1;
-	} elsif ( $c->nodeName eq 'del'
-		  || $c->nodeName eq 'fw'    # for catchwords
-		  || $c->nodeName eq 'sic'
-		  || $c->nodeName eq 'note'  #TODO: decide how to deal with notes
-		  || $c->textContent eq '' 
-		  || ref( $c ) eq 'XML::LibXML::Comment' ) {
-	    next;
-	} else {
-	    my $tagtxt;
-	    if( ref( $c ) eq 'XML::LibXML::Text' ) {
-		# A text node.
-		$tagtxt = $c->textContent;
-	    } else {
-		$tagtxt = _get_text_from_node( $c );
-	    }
-	    if( $strip_leading_space ) {
-		$tagtxt =~ s/^[\s\n]+//s;
-		# Unset the flag as soon as we see non-whitespace.
-		$strip_leading_space = 0 if $tagtxt;
-	    }
-	    $text .= $tagtxt;
-	} 
-    }
-    # If this is in a w tag, strip all the whitespace.
-    if( $node->nodeName eq 'w'
-	|| ( $node->nodeName eq 'seg' 
-	     && $node->getAttribute( 'type' ) eq 'word' ) ) {
-	$text =~ s/\s+//g;
-    }
-    return $text;
+	my( $node ) = @_;
+	my $text = '';
+	# We can have an lb or pb in the middle of a word; if we do, the
+	# whitespace (including \n) after the break becomes insignificant
+	# and we want to nuke it.
+	my $strip_leading_space = 0; 
+	foreach my $c ($node->childNodes() ) {
+		if( $c->nodeName eq 'num' 
+			&& defined $c->getAttribute( 'value' ) ) {
+			# Push the number.
+			$text .= $c->getAttribute( 'value' );
+			# If this is just after a line/page break, return to normal behavior.
+			$strip_leading_space = 0;
+		} elsif ( $c->nodeName =~ /^[lp]b$/ ) {
+			# Set a flag that strips leading whitespace until we
+			# get to the next bit of non-whitespace.
+			$strip_leading_space = 1;
+		} elsif ( $c->nodeName eq 'del'
+				  || $c->nodeName eq 'fw'	 # for catchwords
+				  || $c->nodeName eq 'sic'
+				  || $c->nodeName eq 'note'	 #TODO: decide how to deal with notes
+				  || $c->textContent eq '' 
+				  || ref( $c ) eq 'XML::LibXML::Comment' ) {
+			next;
+		} else {
+			my $tagtxt;
+			if( ref( $c ) eq 'XML::LibXML::Text' ) {
+				# A text node.
+				$tagtxt = $c->textContent;
+			} else {
+				$tagtxt = _get_text_from_node( $c );
+			}
+			if( $strip_leading_space ) {
+				$tagtxt =~ s/^[\s\n]+//s;
+				# Unset the flag as soon as we see non-whitespace.
+				$strip_leading_space = 0 if $tagtxt;
+			}
+			$text .= $tagtxt;
+		} 
+	}
+	# If this is in a w tag, strip all the whitespace.
+	if( $node->nodeName eq 'w'
+		|| ( $node->nodeName eq 'seg' 
+			 && $node->getAttribute( 'type' ) eq 'word' ) ) {
+		$text =~ s/\s+//g;
+	}
+	throw( ident => "text not found",
+	       tags => [ $node->nodeName ],
+	       message => "No text found in node " . $node->nodeName )
+	    unless $text;
+	return $text;
 }
 
 sub _split_words {
@@ -316,8 +334,7 @@ sub _split_words {
  	my @words;
 	foreach my $w ( @raw_words ) {
 		my %opts = ( 'string' => $w, 'ms_sigil' => $self->sigil );
-		$opts{'comparator'} = $self->comparator if $self->comparator;
-		$opts{'canonizer'} = $self->canonizer if $self->canonizer;
+		$opts{'language'} = $self->language;
 		my $w_obj = Text::TEI::Collate::Word->new( %opts );
  		# Skip any words that have been canonized out of existence.
 		next if( length( $w_obj->word ) == 0 );
@@ -346,20 +363,41 @@ sub _init_from_json {
 	$self->replace_words( \@words );
 }
 
+=head2 tokenize_as_json
+
+Returns a JSON serialization of the Manuscript object, of the form:
+
+ { id: $self->sigil, name: $self->identifier, tokens: [ WORDLIST ] }
+
+where each Word object in the word list is serialized as
+
+ { t: $w->word, c: $w->canonical_form, n: $w->comparison_form,
+   punctuation: [ $w->punctuation ], placeholders: [ $w->placeholders ] }
+   
+This method optionally takes a list of array indices to skip when serializing
+the wordlist (useful when we want to exclude certain special tokens.)
+
+=cut
+
 sub tokenize_as_json {
 	my $self = shift;
+	my %skiprow;
+	map { $skiprow{$_} = 1 } @_;
+
 	my @wordlist;
-	foreach ( @{$self->words} ) {
-		if( $_->is_empty ) {
+	foreach my $i ( 0 .. $#{$self->words} ) {
+	    next if $skiprow{$i};
+	    my $w = $self->words->[$i];
+		if( $w->is_empty ) {
 			push( @wordlist, undef );
 		} else {
-			my $word = { 't' => $_->word || '' };
-			$word->{'n'} = $_->comparison_form;
-			$word->{'c'} = $_->canonical_form;
-			$word->{'punctuation'} = [ $_->punctuation ]
-				if scalar( $_->punctuation );
-			$word->{'placeholders'} = [ $_->placeholders ] 
-				if scalar( $_->placeholders );
+			my $word = { 't' => $w->word || '' };
+			$word->{'n'} = $w->comparison_form;
+			$word->{'c'} = $w->canonical_form;
+			$word->{'punctuation'} = [ $w->punctuation ]
+				if scalar( $w->punctuation );
+			$word->{'placeholders'} = [ $w->placeholders ] 
+				if scalar( $w->placeholders );
 			push( @wordlist, $word );
 		}
     }
@@ -396,6 +434,10 @@ sub _init_from_plaintext {
 		return $curr_sig;
 	}
 	
+}
+
+sub throw {
+    Text::TEI::Collate::Error->throw( @_ );
 }
 
 no Moose;

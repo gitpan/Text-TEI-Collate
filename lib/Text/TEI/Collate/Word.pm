@@ -2,7 +2,8 @@ package Text::TEI::Collate::Word;
 
 use strict;
 use Moose;
-use Unicode::Normalize;
+use Module::Load;
+use Text::TEI::Collate::Error;
 use vars qw( $VERSION );
 
 has 'word' => (
@@ -12,17 +13,11 @@ has 'word' => (
 	writer => '_set_word',
 	);
 	
-has 'comparator' => (
-	is => 'ro',
-	isa => 'Maybe[CodeRef]',
-	default => sub { \&unicode_normalize },
-	);
-	
-has 'canonizer' => (
-	is => 'ro',
-	isa => 'Maybe[CodeRef]',
-	default => sub { sub{ lc( $_[0] ) } },
-	);
+has 'language' => (
+    is => 'ro',
+    isa => 'Str',
+    default => 'Default',
+    );
 	
 has 'comparison_form' => (
 	is => 'ro',
@@ -135,7 +130,7 @@ has '_mutable' => (
 	default => sub { [ 'glommed' ] },
 	);
 
-$VERSION = "1.0";
+$VERSION = "1.1";
 
 =head1 NAME
 
@@ -230,6 +225,7 @@ around BUILDARGS => sub {
 			$newargs{'is_empty'} = 1;
 			$newargs{'word'} = '';
 			$newargs{'ms_sigil'} = '';
+			$newargs{'invisible'} = 1;
 		} elsif( $key eq 'special' ) {
 			$newargs{'special'} = $args{'special'};
 			$newargs{'word'} = '';
@@ -326,21 +322,17 @@ sub _evaluate_word {
 
 	# Save the word sans punctuation.
     $self->_set_word( $word );
+    
+    # Get the subroutines we need for the rest.
+    my $mod = 'Text::TEI::Collate::Lang::' . $self->language;
+    load( $mod );
+    my $canonizer = $mod->can( 'canonizer' );
+    my $comparator = $mod->can( 'comparator' );
 
 	# Canonicalize the word, if we have been handed a canonizer.
-	if( defined $self->canonizer ) {
-		$self->_set_canonical_form( &{$self->canonizer}( $word ) );
-	} else {
-		$self->_set_canonical_form( $word );
-	}
-
+	$self->_set_canonical_form( $canonizer->( $word ) );
 	# What is the string we will actually collate against?
-	if( defined $self->comparator ) {
-		$self->_set_comparison_form( &{$self->comparator}( $word ) );
-	} else {
-		$self->_set_comparison_form( $word );
-	}
-
+	$self->_set_comparison_form( $comparator->( $self->canonical_form ) );
 }
 
 # Accessors.
@@ -383,16 +375,10 @@ comparison form.
 If called with an argument, sets the punctuation marks that were passed with
 the word. Returns the word's puncutation.
 
-=head2 canonizer
+=head2 language
 
-If called with an argument, sets the canonizer subroutine that the word object
-should use. Returns the subroutine. Defaults to lc().
-
-=head2 comparator
-
-If called with an argument, sets the comparator subroutine that the word
-object should use. Returns the subroutine. Defaults to unicode_normalize in
-this package.
+The name of the language module we are using (from Text::TEI::Collate::Lang)
+to derive our canonical and comparison word forms.
 
 =head2 special
 
@@ -458,56 +444,18 @@ Removes the given word from this word's list of variants.
 sub unlink_variant {
     my( $self, $other ) = @_;
     my @v = grep { $_ ne $other } $self->variants;
+    if( @v == $self->variants ) {
+        throw( ident => 'missing link',
+               message => "Variant " . $other->printable 
+                    . "not present in list of variants for " . $self->printable );
+    }
     $self->_clear_variants();
     $self->add_variant( @v );
     $other->_clear_variant_of;
 }
 
-=head2 state
-
-Returns a hash of all the values that might be changed by a re-comparison.
-Useful to 'back up' a word before attempting a rematch. Currently does not
-expect any of the 'mutable' keys to contain data structure refs. Meant for
-internal use by the collator.
-
-=cut
-
-sub state {
-	my $self = shift;
-	my $opts = {};
-	foreach my $key( @{$self->_mutable} ) {
-		warn( "Not making full copy of ref stored in $key" ) 
-			if ref( $self->{$key} );
-		$opts->{$key} = $self->{$key};
-	}
-	return $opts;
-}
-
-sub restore_state {
-	my $self = shift;
-	my $opts = shift;
-	return unless ref( $opts ) eq 'HASH';
-	foreach my $key( @{$self->_mutable} ) {
-		$self->{$key} = $opts->{$key};
-	}
-}
-
-=head2 unicode_normalize
-
-A default normalization function for the words we are handed. Strips all
-accents from the word.
-
-=cut
-
-sub unicode_normalize {
-	my $word = shift;
-	my @normalized;
-	my @letters = split( '', lc( $word ) );
-	foreach my $l ( @letters ) {
-		my $d = chr( ord( NFKD( $l ) ) );
-		push( @normalized, $d );
-	}
-	return join( '', @normalized );
+sub throw {
+    Text::TEI::Collate::Error->throw( @_ );
 }
 
 no Moose;
